@@ -1,0 +1,21 @@
+#!/bin/bash
+
+#SBATCH --job-name boltzmann
+#SBATCH --nodes 1
+#SBATCH --ntasks-per-node 1
+#SBATCH --time 00:05:00
+#SBATCH --partition gpu
+#SBATCH --output boltzmann.out
+
+#SBATCH -N1
+#SBATCH --gres=gpu:1
+
+echo Running on host `hostname`
+echo Time is `date`
+echo Directory is `pwd`
+echo Slurm job ID is $SLURM_JOB_ID
+echo This job runs on the following machines:
+echo `echo $SLURM_JOB_NODELIST | uniq`
+
+#! Run the executable
+./boltzmann inputs/input_128x128.params obstacles/obstacles_128x128.dat
