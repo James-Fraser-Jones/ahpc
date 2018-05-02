@@ -49,9 +49,6 @@
 ** if you choose a different obstacle file.
 */
 
-//#pragma omp target teams distribute parallel for simd
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -62,9 +59,17 @@
 #include <omp.h> //GPU
 #include <string.h> //GPU
 
+//#pragma omp target teams distribute parallel for collapse(2)
+//#pragma omp target update to(a[0:N], b[0:N])
+//#pragma omp target update from(c[0:N])
+//#pragma omp target enter data map(alloc: cells[0:N], tmp_cells[0:N], params[0:N])
+//#pragma omp target exit data map(release: a[0:N], b[0:N], c[0:N])
+
 #define NSPEEDS         9
 #define FINALSTATEFILE  "final_state.dat"
 #define AVVELSFILE      "av_vels.dat"
+
+#define GPU 1 //enable or disable GPU pragmas, 1 with GPU, 0 without
 
 /* struct to hold the parameter values */
 typedef struct
@@ -98,13 +103,13 @@ int initialise(const char* paramfile, const char* obstaclefile,
 /*
 ** The main calculation methods.
 ** timestep calls, in order, the functions:
-** accelerate_flow(), propagate(), rebound() & collision()
+** accelerate_flow(), propagate(), doAll() (this is just rebound, collision and av_velocity
 */
 int accelerate_flow(const t_param params, t_speed* cells, int* obstacles);
 int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells);
-float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
-int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
+float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles, float tot_u);
 
+int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
 /* finalise, including freeing up allocated memory */
 int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
              int** obstacles_ptr, float** av_vels_ptr);
@@ -155,6 +160,24 @@ int main(int argc, char* argv[])
 
   /* initialise our data structures and load values from file */
   initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells, &obstacles, &av_vels);
+  
+  float tot_u = 0.0f; //passed back from gpu at each timestep
+  int tot_cells = 0; //used to divide before putting into av_vels
+  for (int jj = 0; jj < params.ny; jj++){
+    for (int ii = 0; ii < params.nx; ii++){
+      if (!obstacles[ii + jj*params.nx]){
+        tot_cells += 1;
+      }
+    }
+  }
+
+#if GPU
+  #pragma omp target enter data map(alloc: cells[0:params.nx*params.ny], tmp_cells[0:params.nx*params.ny], obstacles[0:params.nx*params.ny], tot_u, params)
+  {}
+
+  #pragma omp target update to(cells[0:params.nx*params.ny], tmp_cells[0:params.nx*params.ny], obstacles[0:params.nx*params.ny], tot_u, params)
+  {}
+#endif
 
   /* iterate for maxIters timesteps */
   gettimeofday(&timstr, NULL);
@@ -164,14 +187,18 @@ int main(int argc, char* argv[])
   {
     accelerate_flow(params, cells, obstacles);
     propagate(params, cells, tmp_cells);
-    av_vels[tt] = doAll(params, cells, tmp_cells, obstacles);
-
-    /*
-    printf("==timestep: %d==\n", tt);
-    printf("av velocity: %.12E\n", av_vels[tt]);
-    printf("tot density: %.12E\n", total_density(params, cells));
-    */
+    tot_u = 0.0f; //resets tot_u on the gpu at each iteration
+    tot_u = doAll(params, cells, tmp_cells, obstacles, tot_u);
+    av_vels[tt] = tot_u/(float)tot_cells;
   }
+
+#if GPU
+  #pragma omp target update from(cells[0:params.nx*params.ny])
+  {}
+
+  #pragma omp target exit data map(release: cells[0:params.nx*params.ny], tmp_cells[0:params.nx*params.ny], obstacles[0:params.nx*params.ny], tot_u, params)
+  {}
+#endif
 
   gettimeofday(&timstr, NULL);
   toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
@@ -196,15 +223,16 @@ int main(int argc, char* argv[])
 //accelerate flow is only used on the second from top row of the grid
 int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
 {
-  /* compute weighting factors */
-  float w1 = params.density * params.accel / 9.f;
-  float w2 = params.density * params.accel / 36.f;
-
-  /* modify the 2nd row of the grid */
-  int jj = params.ny - 2;
-
+#if GPU
+#pragma omp target teams distribute parallel for
+#endif
   for (int ii = 0; ii < params.nx; ii++)
   {
+    //initialise constants (try to pull this out of the loop if possible)
+    float w1 = params.density * params.accel / 9.f;
+    float w2 = params.density * params.accel / 36.f;
+    int jj = params.ny - 2;
+
     /* if the cell is not occupied and
     ** we don't send a negative density */
     if (!obstacles[ii + jj*params.nx]
@@ -230,8 +258,10 @@ int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
 //and those cells around it might be changed by the following 3 functions
 int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells)
 {
-  /* loop over _all_ cells */
-  for (int jj = 0; jj < params.ny; jj++)
+#if GPU
+#pragma omp target teams distribute parallel for collapse(2)
+#endif
+  for (int jj = 0; jj < params.ny; jj++) // loop over _all_ cells
   {
     for (int ii = 0; ii < params.nx; ii++)
     {
@@ -260,22 +290,20 @@ int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells)
 }
 
 //does rebound, collision and av_vels in one go
-float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles)
+float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles, float tot_u)
 {
-  const float c_sq = 1.f / 3.f; /* square of speed of sound */
-  const float w0 = 4.f / 9.f;  /* weighting factor */
-  const float w1 = 1.f / 9.f;  /* weighting factor */
-  const float w2 = 1.f / 36.f; /* weighting factor */
-
-  int    tot_cells = 0;  /* no. of cells used in calculation */
-  float tot_u;          /* accumulated magnitudes of velocity for each cell */
-
-  /* initialise */
-  tot_u = 0.f;
-
-  /* loop over the cells in the grid */
-  for (int jj = 0; jj < params.ny; jj++){
+#if GPU
+#pragma omp target teams distribute parallel for map (tofrom:tot_u) reduction(+:tot_u) collapse(2)
+#endif
+  for (int jj = 0; jj < params.ny; jj++){ // loop over the cells in the grid
     for (int ii = 0; ii < params.nx; ii++){
+
+      //initialise constants (try to pull this out of the loop if possible)
+      const float c_sq = 1.f / 3.f; /* square of speed of sound */
+      const float w0 = 4.f / 9.f;  /* weighting factor */
+      const float w1 = 1.f / 9.f;  /* weighting factor */
+      const float w2 = 1.f / 36.f; /* weighting factor */
+
       /* if the cell contains an obstacle */
       if (obstacles[jj*params.nx + ii]){
         /* called after propagate, so taking values from scratch space
@@ -369,7 +397,7 @@ float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obsta
                                                   * (d_equ[kk] - tmp_cells[ii + jj*params.nx].speeds[kk]);
         }
 
-        //////////////////////////////Collision above, Av Vels below/////////////////////////////////
+        //AV VELS BELOW -----------------------------------------------------------------------------------
 
         /* local density total */
         local_density = 0.f;
@@ -397,13 +425,11 @@ float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obsta
                      / local_density;
         /* accumulate the norm of x- and y- velocity components */
         tot_u += sqrtf((u_x * u_x) + (u_y * u_y));
-        /* increase counter of inspected cells */
-        ++tot_cells;
       }
     }
   }
 
-  return tot_u / (float)tot_cells;
+  return tot_u;
 }
 
 //this gets called on its own at the end so I'm keeping it

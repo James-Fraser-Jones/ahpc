@@ -49,8 +49,8 @@
 ** if you choose a different obstacle file.
 */
 
-//#pragma omp target teams distribute parallel for simd
-
+//MPI: Apparently a structure of arrays is better than an array of structures
+//MPI: Make sure spu code vectorises over "spatial" (nx and ny) loop not "speed" loop (all 9 speeds of each cell).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,26 +58,30 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <stdbool.h>
+#include "mpi.h"
 
 #include <omp.h> //GPU
 #include <string.h> //GPU
 
+#define MASTER          0
 #define NSPEEDS         9
 #define FINALSTATEFILE  "final_state.dat"
 #define AVVELSFILE      "av_vels.dat"
+
+#define GPU 0 //enable or disable GPU pragmas, 1 with GPU, 0 without
 
 /* struct to hold the parameter values */
 typedef struct
 {
   int    nx;            /* no. of cells in x-direction */
   int    ny;            /* no. of cells in y-direction */
-  float density;       /* density per link */
-  float accel;         /* density redistribution */
-  float omega;         /* relaxation parameter */
-
-  //dont alias these
   int    maxIters;      /* no. of iterations */
   int    reynolds_dim;  /* dimension for Reynolds number */
+  float density;        /* density per link */
+  float accel;          /* density redistribution */
+  float omega;          /* relaxation parameter */
+  int heightH; //ny for local process (including halos)
 } t_param;
 
 /* struct to hold the 'speed' values */
@@ -86,35 +90,29 @@ typedef struct
   float speeds[NSPEEDS];
 } t_speed;
 
-/*
-** function prototypes
-*/
-
 /* load params, allocate memory, load obstacles & initialise fluid particle densities */
 int initialise(const char* paramfile, const char* obstaclefile,
                t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
-               int** obstacles_ptr, float** av_vels_ptr);
+               int** obstacles_ptr, int** all_obstacles_ptr, float** av_vels_ptr, int myRank, int numProcs);
 
-/*
-** The main calculation methods.
-** timestep calls, in order, the functions:
-** accelerate_flow(), propagate(), rebound() & collision()
-*/
-int accelerate_flow(const t_param params, t_speed* cells, int* obstacles);
+int accelerate_flow(const t_param params, t_speed* cells, int* obstacles, bool b);
+
+int halo_exchange(const t_param params, t_speed* cells, int up, int down, MPI_Status status,
+                  t_speed* botHalo, t_speed* botRow, t_speed* topRow, t_speed* topHalo);
+
+//these all need to be combined into do everything
+float doEverything(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles, float tot_u);
 int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells);
-float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
+float av_velocity(const t_param params, t_speed* cells, int* obstacles);
+
 int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels);
 
 /* finalise, including freeing up allocated memory */
 int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
              int** obstacles_ptr, float** av_vels_ptr);
 
-/* Sum all the densities in the grid.
-** The total should remain constant from one timestep to the next. */
+/* Sum all the densities in the grid. The total should remain constant from one timestep to the next. */
 float total_density(const t_param params, t_speed* cells);
-
-/* compute average velocity */
-float av_velocity(const t_param params, t_speed* cells, int* obstacles);
 
 /* calculate Reynolds number */
 float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
@@ -123,88 +121,253 @@ float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
 void die(const char* message, const int line, const char* file);
 void usage(const char* exe);
 
-/*
-** main program:
-** initialise, timestep loop, finalise
-*/
-int main(int argc, char* argv[])
-{
+/* main program: initialise, timestep loop, finalise */
+int main(int argc, char* argv[]){
+  //initialise boltzmann variables for all processes
   char*    paramfile = NULL;    /* name of the input parameter file */
   char*    obstaclefile = NULL; /* name of a the input obstacle file */
   t_param  params;              /* struct to hold parameter values */
   t_speed* cells     = NULL;    /* grid containing fluid densities */
   t_speed* tmp_cells = NULL;    /* scratch space */
   int*     obstacles = NULL;    /* grid indicating which cells are blocked */
-  float* av_vels   = NULL;     /* a record of the av. velocity computed for each timestep */
+  int*     all_obstacles = NULL;    /* obstacles for entire grid */
+  float*   av_vels   = NULL;     /* a record of the av. velocity computed for each timestep */
+
+  //unfortunately, timing variables need to be declared for everyone
   struct timeval timstr;        /* structure to hold elapsed time */
   struct rusage ru;             /* structure to hold CPU time--system and user */
   double tic, toc;              /* floating point numbers to calculate elapsed wallclock time */
   double usrtim;                /* floating point number to record elapsed user CPU time */
   double systim;                /* floating point number to record elapsed system CPU time */
 
+  //initialise MPI variables for all processes
+  int myRank;                   /* the rank of this process */
+  int numProcs;                 /* number of processes in the communicator */
+  int up;                       /* the rank of the process to the above */
+  int down;                     /* the rank of the process to the below */
+  MPI_Status status;            /* struct used by MPI_Recv */
+  t_speed* botHalo;             /* pointer to start of bottom halo of cells grid */
+  t_speed* botRow;              /* pointer to start of bottom row of cells grid */
+  t_speed* topRow;              /* pointer to start of top row of cells grid */
+  t_speed* topHalo;             /* pointer to start of top halo of cells grid */
+
+  /* MPI_Init returns once it has started up processes */
+  MPI_Init( &argc, &argv );
+
+  /* size and rank will become ubiquitous */
+  MPI_Comm_size( MPI_COMM_WORLD, &numProcs );
+  MPI_Comm_rank( MPI_COMM_WORLD, &myRank );
+
+  //set values for processes above and below current process
+  up = (myRank + 1) % numProcs;
+  down = (myRank == 0) ? (myRank + numProcs - 1) : (myRank - 1);
+
   /* parse the command line */
-  if (argc != 3)
-  {
+  if (argc != 3){
     usage(argv[0]);
   }
-  else
-  {
+  else{
     paramfile = argv[1];
     obstaclefile = argv[2];
   }
 
   /* initialise our data structures and load values from file */
-  initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells, &obstacles, &av_vels);
+  initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells, &obstacles, &all_obstacles, &av_vels, myRank, numProcs);
+  float tot_u = 0.0f; //passed back from gpu at each timestep
+  bool b = false; //passed to gpu in accelerate flow
 
-  /* iterate for maxIters timesteps */
-  gettimeofday(&timstr, NULL);
-  tic = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
+#if GPU //GPU CELLS ONLY NEEDS TO BE ALLOCATED FOR SMALLER GRID SIZE AKA params.nx*params.heightH
+  #pragma omp target enter data map(alloc: cells[0:params.nx*params.heightH], tmp_cells[0:params.nx*params.heightH], obstacles[0:params.nx*params.heightH], tot_u, params, b)
+  {}
 
-  for (int tt = 0; tt < params.maxIters; tt++)
-  {
-    accelerate_flow(params, cells, obstacles);
-    propagate(params, cells, tmp_cells);
-    av_vels[tt] = doAll(params, cells, tmp_cells, obstacles);
+  #pragma omp target update to(cells[0:params.nx*params.heightH], tmp_cells[0:params.nx*params.heightH], obstacles[0:params.nx*params.heightH], tot_u, params, b)
+  {}
+#endif
 
-    /*
-    printf("==timestep: %d==\n", tt);
-    printf("av velocity: %.12E\n", av_vels[tt]);
-    printf("tot density: %.12E\n", total_density(params, cells));
-    */
+  //set row and halo pointers to the correct values now that the memory for the cells has been allocated
+  botHalo = &cells[0];
+  botRow = &cells[params.nx];
+  topRow = &cells[(params.heightH-2)*params.nx];
+  topHalo = &cells[(params.heightH-1)*params.nx];
+
+  //start timer if MASTER process
+  tic = 0.0f;
+  if (myRank == MASTER){
+    gettimeofday(&timstr, NULL);
+    tic = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
   }
 
-  gettimeofday(&timstr, NULL);
-  toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
-  getrusage(RUSAGE_SELF, &ru);
-  timstr = ru.ru_utime;
-  usrtim = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
-  timstr = ru.ru_stime;
-  systim = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
+  /* MAIN LOOP */
+  for (int tt = 0; tt < params.maxIters; tt++){
 
-  /* write final values and free memory */
-  printf("==done==\n");
-  printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, cells, obstacles));
-  printf("Elapsed time:\t\t\t%.6lf (s)\n", toc - tic);
-  printf("Elapsed user CPU time:\t\t%.6lf (s)\n", usrtim);
-  printf("Elapsed system CPU time:\t%.6lf (s)\n", systim);
-  write_values(params, cells, obstacles, av_vels);
+    if ((params.ny / numProcs) == 1){ //edge case where top process only contains first row of entire grid
+      if (myRank == (numProcs - 2)){
+        b = true;
+        accelerate_flow(params, cells, obstacles, b);
+      }
+    }
+    else{
+      if (myRank == (numProcs - 1)){ //top process contains a minimum of 2 rows of the grid
+        b = false;
+        accelerate_flow(params, cells, obstacles, b);
+      }
+    }
+
+#if GPU
+    #pragma omp target map(from:cells[0:params.nx])
+    {}
+    #pragma omp target map(from:cells[((params.heightH-1)*params.nx):params.nx])
+    {}
+#endif
+
+    halo_exchange(params, cells, up, down, status, botHalo, botRow, topRow, topHalo);
+
+#if GPU
+    #pragma omp target map(to:cells[params.nx:params.nx])
+    {}
+    #pragma omp target map(to:cells[((params.heightH-2)*params.nx):params.nx])
+    {}
+#endif
+
+    propagate(params, cells, tmp_cells);
+
+    tot_u = 0.0f;
+    tot_u = doEverything(params, cells, tmp_cells, obstacles, tot_u);
+    av_vels[tt] = tot_u;
+  }
+
+#if GPU
+  #pragma omp target update from(cells[0:params.nx*params.heightH])
+  {}
+
+  #pragma omp target exit data map(release: cells[0:params.nx*params.heightH], tmp_cells[0:params.nx*params.heightH], obstacles[0:params.nx*params.heightH], tot_u, params)
+  {}
+#endif
+
+  //sending stuff back to master process once the main loop has finished
+  if (myRank == MASTER){
+    int numCells = 0;
+    int height = params.ny / numProcs;
+    int wrap = params.ny % numProcs;
+    t_speed* all_cells = NULL; //pointer to start of array of cells
+    t_speed* cell_insert = NULL; //pointer to current part of array where you want to read in data
+    float* temp_vels = NULL;
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    //allocate and clear the memory for the whole grid
+    all_cells = (t_speed*)malloc(sizeof(t_speed) * (params.ny * params.nx));
+    for (int i = 0; i < (params.ny * params.nx); i++){
+      for (int j = 0; j < NSPEEDS; j++){
+        all_cells[i].speeds[j] = 0.0f;
+      }
+    }
+
+    //add master's portion of the grid
+    cell_insert = all_cells;
+    for (int i = 0; i < ((params.heightH-2) * params.nx); i++){
+      cell_insert[i] = botRow[i];
+    }
+    cell_insert = &cell_insert[(params.heightH-2) * params.nx];
+
+    //add every other rank's portion of the grid
+    for (int rank = 1; rank < numProcs; rank++){
+      int curHeight = height;
+      if (rank < wrap){
+        curHeight += 1;
+      }
+      MPI_Recv(cell_insert, (curHeight * params.nx * NSPEEDS), MPI_FLOAT, rank, 0, MPI_COMM_WORLD, &status);
+      cell_insert = &cell_insert[curHeight * params.nx];
+    }
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    //allocate and clear memory for temp_vels
+    temp_vels = malloc(sizeof(float) * params.maxIters);
+    for (int i = 0; i < params.maxIters; i++){
+      temp_vels[i] = 0.0f;
+    }
+
+    //receive av_vels from every rank and add them to master rank
+    for (int rank = 1; rank < numProcs; rank++){
+      MPI_Recv(temp_vels, params.maxIters, MPI_FLOAT, rank, 0, MPI_COMM_WORLD, &status);
+      for (int i = 0; i < params.maxIters; i++){
+        av_vels[i] += temp_vels[i];
+      }
+    }
+
+    //free up memory again
+    free(temp_vels);
+    temp_vels = NULL;
+
+    //count number of non-obstacle cells
+    for (int i = 0; i < (params.nx * params.ny); i++){
+      if (all_obstacles[i] != 1){
+        numCells += 1;
+      }
+    }
+
+    //divide all av_vels by number of non-obstacle cells
+    for (int j = 0; j < params.maxIters; j++){
+      av_vels[j] = av_vels[j]/(float) numCells; //divide each avvel by the total number of obstacles
+    }
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    //end timer and finish up computation if MASTER process
+    gettimeofday(&timstr, NULL);
+    toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
+    getrusage(RUSAGE_SELF, &ru);
+    timstr = ru.ru_utime;
+    usrtim = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
+    timstr = ru.ru_stime;
+    systim = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
+
+    /* write final values and free memory */
+    printf("==done==\n");
+    printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, all_cells, all_obstacles));
+    printf("Elapsed time:\t\t\t%.6lf (s)\n", toc - tic);
+    printf("Elapsed user CPU time:\t\t%.6lf (s)\n", usrtim);
+    printf("Elapsed system CPU time:\t%.6lf (s)\n", systim);
+    write_values(params, all_cells, all_obstacles, av_vels);
+
+    free(all_obstacles);
+    all_obstacles = NULL;
+  }
+  else{
+    //if not the master process, send over your section of the grid and your average velocities
+    MPI_Send(botRow, ((params.heightH-2) * params.nx * NSPEEDS), MPI_FLOAT, MASTER, 0, MPI_COMM_WORLD);
+    MPI_Send(av_vels, params.maxIters, MPI_FLOAT, MASTER, 0, MPI_COMM_WORLD);
+  }
+
   finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels);
+
+  MPI_Finalize();
+  return EXIT_SUCCESS;
+}
+
+int halo_exchange(const t_param params, t_speed* cells, int up, int down, MPI_Status status,
+                  t_speed* botHalo, t_speed* botRow, t_speed* topRow, t_speed* topHalo){
+
+  MPI_Sendrecv(topRow, NSPEEDS*params.nx, MPI_FLOAT, up, 0, //send top row to bottom halo of above process
+        botHalo, NSPEEDS*params.nx, MPI_FLOAT, down, 0, MPI_COMM_WORLD, &status); //recieve top row of below process to bottom halo
+  MPI_Sendrecv(botRow, NSPEEDS*params.nx, MPI_FLOAT, down, 0, //send bottom row to top halo of below process
+        topHalo, NSPEEDS*params.nx, MPI_FLOAT, up, 0, MPI_COMM_WORLD, &status); //receive bottom row of above process to top halo
 
   return EXIT_SUCCESS;
 }
 
-//accelerate flow is only used on the second from top row of the grid
-int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
-{
-  /* compute weighting factors */
-  float w1 = params.density * params.accel / 9.f;
-  float w2 = params.density * params.accel / 36.f;
-
-  /* modify the 2nd row of the grid */
-  int jj = params.ny - 2;
-
+int accelerate_flow(const t_param params, t_speed* cells, int* obstacles, bool b){
+#if GPU
+#pragma omp target teams distribute parallel for // not necessary to map b into gpu every call because we know it must always be false
+#endif
   for (int ii = 0; ii < params.nx; ii++)
   {
+    //set constants, this has to be inside loop for gpu but, again, is very inefficient
+    float w1 = params.density * params.accel / 9.f;
+    float w2 = params.density * params.accel / 36.f;
+    int jj = params.heightH - 3;
+    if (b) {
+      jj = params.heightH - 2; //edge case where 2ft process accesses top row rather than top process accessing 2ft row
+    }                          //2ft = Second from top, (halos are excluded)
+
     /* if the cell is not occupied and
     ** we don't send a negative density */
     if (!obstacles[ii + jj*params.nx]
@@ -226,60 +389,20 @@ int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
   return EXIT_SUCCESS;
 }
 
-//propagate must be called before the following 3 because each cell depends on those around it
-//and those cells around it might be changed by the following 3 functions
-int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells)
-{
-  /* loop over _all_ cells */
-  for (int jj = 0; jj < params.ny; jj++)
-  {
-    for (int ii = 0; ii < params.nx; ii++)
-    {
-      /* determine indices of axis-direction neighbours
-      ** respecting periodic boundary conditions (wrap around) */
-      int y_n = (jj + 1) % params.ny;
-      int x_e = (ii + 1) % params.nx;
-      int y_s = (jj == 0) ? (jj + params.ny - 1) : (jj - 1);
-      int x_w = (ii == 0) ? (ii + params.nx - 1) : (ii - 1);
-      /* propagate densities from neighbouring cells, following
-      ** appropriate directions of travel and writing into
-      ** scratch space grid */
-      tmp_cells[ii + jj*params.nx].speeds[0] = cells[ii + jj*params.nx].speeds[0]; /* central cell, no movement */
-      tmp_cells[ii + jj*params.nx].speeds[1] = cells[x_w + jj*params.nx].speeds[1]; /* east */
-      tmp_cells[ii + jj*params.nx].speeds[2] = cells[ii + y_s*params.nx].speeds[2]; /* north */
-      tmp_cells[ii + jj*params.nx].speeds[3] = cells[x_e + jj*params.nx].speeds[3]; /* west */
-      tmp_cells[ii + jj*params.nx].speeds[4] = cells[ii + y_n*params.nx].speeds[4]; /* south */
-      tmp_cells[ii + jj*params.nx].speeds[5] = cells[x_w + y_s*params.nx].speeds[5]; /* north-east */
-      tmp_cells[ii + jj*params.nx].speeds[6] = cells[x_e + y_s*params.nx].speeds[6]; /* north-west */
-      tmp_cells[ii + jj*params.nx].speeds[7] = cells[x_e + y_n*params.nx].speeds[7]; /* south-west */
-      tmp_cells[ii + jj*params.nx].speeds[8] = cells[x_w + y_n*params.nx].speeds[8]; /* south-east */
-    }
-  }
-
-  return EXIT_SUCCESS;
-}
-
-//does rebound, collision and av_vels in one go
-float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles)
-{
-  const float c_sq = 1.f / 3.f; /* square of speed of sound */
-  const float w0 = 4.f / 9.f;  /* weighting factor */
-  const float w1 = 1.f / 9.f;  /* weighting factor */
-  const float w2 = 1.f / 36.f; /* weighting factor */
-
-  int    tot_cells = 0;  /* no. of cells used in calculation */
-  float tot_u;          /* accumulated magnitudes of velocity for each cell */
-
-  /* initialise */
-  tot_u = 0.f;
-
-  /* loop over the cells in the grid */
-  for (int jj = 0; jj < params.ny; jj++){
+float doEverything(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles, float tot_u){
+#if GPU
+#pragma omp target teams distribute parallel for map (tofrom:tot_u) reduction(+:tot_u) collapse(2)
+#endif
+  for (int jj = 1; jj < params.heightH-1; jj++){ //Only use local rows and do not include halos (row 1 and row params.height-2 require halo exchange first)
     for (int ii = 0; ii < params.nx; ii++){
-      /* if the cell contains an obstacle */
+
+      //assign constants (this is super inefficient unless using gpu where loop becomes parallelized, check run time with the non openmp version to check)
+      const float c_sq = 1.f / 3.f; /* square of speed of sound */
+      const float w0 = 4.f / 9.f;  /* weighting factor */
+      const float w1 = 1.f / 9.f;  /* weighting factor */
+      const float w2 = 1.f / 36.f; /* weighting factor */
+
       if (obstacles[jj*params.nx + ii]){
-        /* called after propagate, so taking values from scratch space
-        ** mirroring, and writing into main grid */
         cells[ii + jj*params.nx].speeds[1] = tmp_cells[ii + jj*params.nx].speeds[3];
         cells[ii + jj*params.nx].speeds[2] = tmp_cells[ii + jj*params.nx].speeds[4];
         cells[ii + jj*params.nx].speeds[3] = tmp_cells[ii + jj*params.nx].speeds[1];
@@ -289,7 +412,7 @@ float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obsta
         cells[ii + jj*params.nx].speeds[7] = tmp_cells[ii + jj*params.nx].speeds[5];
         cells[ii + jj*params.nx].speeds[8] = tmp_cells[ii + jj*params.nx].speeds[6];
       }
-      else {
+      else{
         /* compute local density total */
         float local_density = 0.f;
 
@@ -369,7 +492,7 @@ float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obsta
                                                   * (d_equ[kk] - tmp_cells[ii + jj*params.nx].speeds[kk]);
         }
 
-        //////////////////////////////Collision above, Av Vels below/////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////////////
 
         /* local density total */
         local_density = 0.f;
@@ -398,17 +521,47 @@ float doAll(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obsta
         /* accumulate the norm of x- and y- velocity components */
         tot_u += sqrtf((u_x * u_x) + (u_y * u_y));
         /* increase counter of inspected cells */
-        ++tot_cells;
       }
     }
   }
 
-  return tot_u / (float)tot_cells;
+  return tot_u;
 }
 
-//this gets called on its own at the end so I'm keeping it
-float av_velocity(const t_param params, t_speed* cells, int* obstacles)
-{
+int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells){
+#if GPU
+#pragma omp target teams distribute parallel for collapse(2)
+#endif
+  for (int jj = 1; jj < params.heightH-1; jj++){ //Only use local rows and do not include halos (row 1 and row params.height-2 require halo exchange first)
+    for (int ii = 0; ii < params.nx; ii++){
+      /* determine indices of axis-direction neighbours
+      ** respecting periodic boundary conditions (wrap around) */
+
+      //MPI: No wrap around necessary here.
+      int y_n = (jj + 1);
+      int y_s = (jj - 1);
+
+      int x_e = (ii + 1) % params.nx;
+      int x_w = (ii == 0) ? (ii + params.nx - 1) : (ii - 1);
+      /* propagate densities from neighbouring cells, following
+      ** appropriate directions of travel and writing into
+      ** scratch space grid */
+      tmp_cells[ii + jj*params.nx].speeds[0] = cells[ii + jj*params.nx].speeds[0]; /* central cell, no movement */
+      tmp_cells[ii + jj*params.nx].speeds[1] = cells[x_w + jj*params.nx].speeds[1]; /* east */
+      tmp_cells[ii + jj*params.nx].speeds[2] = cells[ii + y_s*params.nx].speeds[2]; /* north */
+      tmp_cells[ii + jj*params.nx].speeds[3] = cells[x_e + jj*params.nx].speeds[3]; /* west */
+      tmp_cells[ii + jj*params.nx].speeds[4] = cells[ii + y_n*params.nx].speeds[4]; /* south */
+      tmp_cells[ii + jj*params.nx].speeds[5] = cells[x_w + y_s*params.nx].speeds[5]; /* north-east */
+      tmp_cells[ii + jj*params.nx].speeds[6] = cells[x_e + y_s*params.nx].speeds[6]; /* north-west */
+      tmp_cells[ii + jj*params.nx].speeds[7] = cells[x_e + y_n*params.nx].speeds[7]; /* south-west */
+      tmp_cells[ii + jj*params.nx].speeds[8] = cells[x_w + y_n*params.nx].speeds[8]; /* south-east */
+    }
+  }
+
+  return EXIT_SUCCESS;
+}
+
+float av_velocity(const t_param params, t_speed* cells, int* obstacles){
   int    tot_cells = 0;  /* no. of cells used in calculation */
   float tot_u;          /* accumulated magnitudes of velocity for each cell */
 
@@ -416,7 +569,7 @@ float av_velocity(const t_param params, t_speed* cells, int* obstacles)
   tot_u = 0.f;
 
   /* loop over all non-blocked cells */
-  for (int jj = 0; jj < params.ny; jj++)
+  for (int jj = 1; jj < params.heightH-1; jj++) //Only use local rows and do not include halos
   {
     for (int ii = 0; ii < params.nx; ii++)
     {
@@ -455,13 +608,13 @@ float av_velocity(const t_param params, t_speed* cells, int* obstacles)
     }
   }
 
-  return tot_u / (float)tot_cells;
+  //MPI: Don't divide by number of cells because this will be different for different sizes of grid in each process
+  return tot_u;
 }
 
-//these 2 functions are called at the start and end
 int initialise(const char* paramfile, const char* obstaclefile,
                t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
-               int** obstacles_ptr, float** av_vels_ptr)
+               int** obstacles_ptr, int** all_obstacles_ptr, float** av_vels_ptr, int myRank, int numProcs)
 {
   char   message[1024];  /* message buffer */
   FILE*   fp;            /* file pointer */
@@ -529,18 +682,40 @@ int initialise(const char* paramfile, const char* obstaclefile,
   ** a 1D array of these structs.
   */
 
+  /*MPI: Do some corrective stuff here to both change ny to the correct height for this process, and also to define the
+  range in which obstacles should be accepted and also how much the ones which are accepted should be reduced by regarding
+  their index so that everything just kinda works. */
+  int height = (params->ny / numProcs);
+  int start = myRank * height;
+
+  if (myRank < (params->ny % numProcs)){
+    height += 1;
+    start += myRank;
+  }
+  else{
+    start += (params->ny % numProcs);
+  }
+
+  int topHalo = (start + height) % params->ny; //set halo indecies
+  int botHalo = (start == 0) ? (params->ny - 1) : (start - 1);
+
+  params->heightH = height + 2;
+
   /* main grid */
-  *cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (params->ny * params->nx));
+  *cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (params->heightH * params->nx));
 
   if (*cells_ptr == NULL) die("cannot allocate memory for cells", __LINE__, __FILE__);
 
   /* 'helper' grid, used as scratch space */
-  *tmp_cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (params->ny * params->nx));
+  *tmp_cells_ptr = (t_speed*)malloc(sizeof(t_speed) * (params->heightH * params->nx));
 
   if (*tmp_cells_ptr == NULL) die("cannot allocate memory for tmp_cells", __LINE__, __FILE__);
 
   /* the map of obstacles */
-  *obstacles_ptr = malloc(sizeof(int) * (params->ny * params->nx));
+  *obstacles_ptr = malloc(sizeof(int) * (params->heightH * params->nx));
+  if (myRank == MASTER){
+    *all_obstacles_ptr = malloc(sizeof(int) * (params->ny * params->nx));
+  }
 
   if (*obstacles_ptr == NULL) die("cannot allocate column memory for obstacles", __LINE__, __FILE__);
 
@@ -549,7 +724,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
   float w1 = params->density      / 9.f;
   float w2 = params->density      / 36.f;
 
-  for (int jj = 0; jj < params->ny; jj++)
+  for (int jj = 0; jj < params->heightH; jj++)
   {
     for (int ii = 0; ii < params->nx; ii++)
     {
@@ -569,11 +744,21 @@ int initialise(const char* paramfile, const char* obstaclefile,
   }
 
   /* first set all cells in obstacle array to zero */
-  for (int jj = 0; jj < params->ny; jj++)
+  for (int jj = 0; jj < params->heightH; jj++)
   {
     for (int ii = 0; ii < params->nx; ii++)
     {
       (*obstacles_ptr)[ii + jj*params->nx] = 0;
+    }
+  }
+
+  if (myRank == MASTER){
+    for (int jj = 0; jj < params->heightH; jj++)
+    {
+      for (int ii = 0; ii < params->nx; ii++)
+      {
+        (*all_obstacles_ptr)[ii + jj*params->nx] = 0;
+      }
     }
   }
 
@@ -598,9 +783,22 @@ int initialise(const char* paramfile, const char* obstaclefile,
 
     if (blocked != 1) die("obstacle blocked value should be 1", __LINE__, __FILE__);
 
-    /* assign to array */
-    (*obstacles_ptr)[xx + yy*params->nx] = blocked;
+    if ((yy >= start) && (yy < start + height)){ //correct range
+      (*obstacles_ptr)[xx + (yy-start+1)*params->nx] = blocked;
+    }
+    else if (yy == topHalo){ //is in the top buffer
+      (*obstacles_ptr)[xx + (params->heightH-1)*params->nx] = blocked;
+    }
+    else if (yy == botHalo){ //is in the bottom buffer
+      (*obstacles_ptr)[xx] = blocked;
+    }
+
+    if (myRank == MASTER){
+      (*all_obstacles_ptr)[xx + yy*params->nx] = blocked;
+    }
   }
+
+  /**/
 
   /* and close the file */
   fclose(fp);
@@ -614,9 +812,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
   return EXIT_SUCCESS;
 }
 
-int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr,
-             int** obstacles_ptr, float** av_vels_ptr)
-{
+int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr, int** obstacles_ptr, float** av_vels_ptr){
   /*
   ** free up allocated memory
   */
@@ -635,17 +831,13 @@ int finalise(const t_param* params, t_speed** cells_ptr, t_speed** tmp_cells_ptr
   return EXIT_SUCCESS;
 }
 
-//NOTHING BELOW HERE NEEDS CHANGING
-
-float calc_reynolds(const t_param params, t_speed* cells, int* obstacles)
-{
+float calc_reynolds(const t_param params, t_speed* cells, int* obstacles){
   const float viscosity = 1.f / 6.f * (2.f / params.omega - 1.f);
 
   return av_velocity(params, cells, obstacles) * params.reynolds_dim / viscosity;
 }
 
-float total_density(const t_param params, t_speed* cells)
-{
+float total_density(const t_param params, t_speed* cells){
   float total = 0.f;  /* accumulator */
 
   for (int jj = 0; jj < params.ny; jj++)
@@ -662,8 +854,7 @@ float total_density(const t_param params, t_speed* cells)
   return total;
 }
 
-int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels)
-{
+int write_values(const t_param params, t_speed* cells, int* obstacles, float* av_vels){
   FILE* fp;                     /* file pointer */
   const float c_sq = 1.f / 3.f; /* sq. of speed of sound */
   float local_density;         /* per grid cell sum of densities */
@@ -745,16 +936,14 @@ int write_values(const t_param params, t_speed* cells, int* obstacles, float* av
   return EXIT_SUCCESS;
 }
 
-void die(const char* message, const int line, const char* file)
-{
+void die(const char* message, const int line, const char* file){
   fprintf(stderr, "Error at line %d of file %s:\n", line, file);
   fprintf(stderr, "%s\n", message);
   fflush(stderr);
   exit(EXIT_FAILURE);
 }
 
-void usage(const char* exe)
-{
+void usage(const char* exe){
   fprintf(stderr, "Usage: %s <paramfile> <obstaclefile>\n", exe);
   exit(EXIT_FAILURE);
 }
