@@ -69,7 +69,7 @@
 #define FINALSTATEFILE  "final_state.dat"
 #define AVVELSFILE      "av_vels.dat"
 
-#define GPU 0 //enable or disable GPU pragmas, 1 with GPU, 0 without
+#define GPU 1 //enable or disable GPU pragmas, 1 with GPU, 0 without
 
 /* struct to hold the parameter values */
 typedef struct
@@ -176,7 +176,7 @@ int main(int argc, char* argv[]){
   float tot_u = 0.0f; //passed back from gpu at each timestep
   bool b = false; //passed to gpu in accelerate flow
 
-#if GPU //GPU CELLS ONLY NEEDS TO BE ALLOCATED FOR SMALLER GRID SIZE AKA params.nx*params.heightH
+#if GPU
   #pragma omp target enter data map(alloc: cells[0:params.nx*params.heightH], tmp_cells[0:params.nx*params.heightH], obstacles[0:params.nx*params.heightH], tot_u, params, b)
   {}
 
@@ -216,6 +216,7 @@ int main(int argc, char* argv[]){
 #if GPU
     #pragma omp target map(from:cells[0:params.nx])
     {}
+
     #pragma omp target map(from:cells[((params.heightH-1)*params.nx):params.nx])
     {}
 #endif
@@ -225,6 +226,7 @@ int main(int argc, char* argv[]){
 #if GPU
     #pragma omp target map(to:cells[params.nx:params.nx])
     {}
+
     #pragma omp target map(to:cells[((params.heightH-2)*params.nx):params.nx])
     {}
 #endif
@@ -328,8 +330,8 @@ int main(int argc, char* argv[]){
     printf("Elapsed system CPU time:\t%.6lf (s)\n", systim);
     write_values(params, all_cells, all_obstacles, av_vels);
 
-    free(all_obstacles);
-    all_obstacles = NULL;
+    //free(all_obstacles);
+    //all_obstacles = NULL;
   }
   else{
     //if not the master process, send over your section of the grid and your average velocities
@@ -337,7 +339,7 @@ int main(int argc, char* argv[]){
     MPI_Send(av_vels, params.maxIters, MPI_FLOAT, MASTER, 0, MPI_COMM_WORLD);
   }
 
-  finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels);
+  //finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels);
 
   MPI_Finalize();
   return EXIT_SUCCESS;
@@ -562,14 +564,11 @@ int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells){
 }
 
 float av_velocity(const t_param params, t_speed* cells, int* obstacles){
-  int    tot_cells = 0;  /* no. of cells used in calculation */
-  float tot_u;          /* accumulated magnitudes of velocity for each cell */
-
-  /* initialise */
-  tot_u = 0.f;
+  int tot_cells = 0;  /* no. of cells used in calculation */
+  float tot_u = 0.0f;          /* accumulated magnitudes of velocity for each cell */
 
   /* loop over all non-blocked cells */
-  for (int jj = 1; jj < params.heightH-1; jj++) //Only use local rows and do not include halos
+  for (int jj = 1; jj < params.ny; jj++) //Only use local rows and do not include halos
   {
     for (int ii = 0; ii < params.nx; ii++)
     {
@@ -609,7 +608,7 @@ float av_velocity(const t_param params, t_speed* cells, int* obstacles){
   }
 
   //MPI: Don't divide by number of cells because this will be different for different sizes of grid in each process
-  return tot_u;
+  return tot_u/(float)tot_cells;
 }
 
 int initialise(const char* paramfile, const char* obstaclefile,
